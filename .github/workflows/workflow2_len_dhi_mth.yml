@@ -27,7 +27,7 @@ jobs:
         run: python workflow2.py
 
       - name: Upload results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: workflow2_results
           path: workflow2_results.csv
