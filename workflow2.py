@@ -20,17 +20,30 @@ def compute_zscore(spread, window):
     return (spread - mean) / std
 
 def half_life(spread):
-    spread_lag = spread.shift(1)
-    spread_ret = spread - spread_lag
-    beta = np.polyfit(spread_lag[1:], spread_ret[1:], 1)[0]
+    spread = spread.dropna()
+    spread_lag = spread.shift(1).dropna()
+    spread_ret = (spread - spread_lag).dropna()
+
+    if len(spread_lag) < 2:  # za mało danych
+        return np.inf
+
+    beta = np.polyfit(spread_lag.values, spread_ret.values, 1)[0]
     return -np.log(2) / beta if beta != 0 else np.inf
 
 # --- Główny loop --- #
 results = []
 
 for x, y in pairs:
-    df_x = yf.download(x, period="180d")['Close']
-    df_y = yf.download(y, period="180d")['Close']
+    # Pobierz dane z auto_adjust=True
+    df_x = yf.download(x, period="180d", auto_adjust=True)['Close']
+    df_y = yf.download(y, period="180d", auto_adjust=True)['Close']
+
+    # Usuń NaN i dopasuj wspólne daty
+    df_x = df_x.dropna()
+    df_y = df_y.dropna()
+    common_index = df_x.index.intersection(df_y.index)
+    df_x = df_x.loc[common_index]
+    df_y = df_y.loc[common_index]
 
     spread = df_y - df_x
     z60 = compute_zscore(spread, Z_WINDOW_LONG)
@@ -59,6 +72,7 @@ for x, y in pairs:
         "Entry_signal": entry_signal
     })
 
+# --- Zapis wyników --- #
 df_res = pd.DataFrame(results)
 df_res.to_csv("workflow2_results.csv", index=False)
 print(df_res)
