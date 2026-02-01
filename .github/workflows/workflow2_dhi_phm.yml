@@ -1,4 +1,4 @@
-name: Workflow 2 - DHI/PHM Trade Readiness
+name: Workflow2 DHI/PHM
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
     - cron: "0 22 * * *"  # codziennie o 22:00 UTC
 
 jobs:
-  analyze-dhi-phm:
+  analyze_pair:
     runs-on: ubuntu-latest
 
     steps:
@@ -23,23 +23,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements1.txt
 
-      - name: Run DHI/PHM trade analysis
-        run: |
-          python analyze_dhi_phm_trade.py \
-            --start-date 2018-01-01 \
-            --auto-adjust \
-            --out-dir results_workflow2
+      - name: Create output directory
+        run: mkdir -p results_workflow2
 
-      - name: Upload CSV & JSON results
+      - name: Run DHI/PHM analysis
+        run: |
+          python analyze_dhi_phm_trade.py --start-date 2018-01-01 --auto-adjust --out-dir results_workflow2 --plot
+
+      - name: Upload CSV, JSON & PNG artifacts
         uses: actions/upload-artifact@v4
         with:
           name: dhi_phm_results
-          path: results_workflow2/DHI_PHM_trade_readiness.*
-
-      - name: Upload PNG chart (optional)
-        uses: actions/upload-artifact@v4
-        with:
-          name: dhi_phm_chart
-          path: results_workflow2/DHI_PHM_spread_chart.png
-          if-no-files-found: ignore
-
+          path: |
+            results_workflow2/DHI_PHM_trade_readiness.csv
+            results_workflow2/DHI_PHM_trade_readiness.json
+            results_workflow2/DHI_PHM_spread_chart.png
