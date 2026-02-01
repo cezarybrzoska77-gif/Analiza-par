@@ -2,18 +2,16 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
-# --- Ustawienia --- #
+# --- Parametry --- #
 pairs = [("LEN", "MTH"), ("DHI", "MTH")]
 Z_WINDOW_LONG = 60
 Z_WINDOW_SHORT = 30
 AVG_ABS_Z_LIMIT = 1.5
 Z60_ENTRY_THRESHOLD = 2.0
-Z60_PREFERRED = 2.2
 Z30_CONFIRM = 1.3
 Z60_EXIT_TP = 0.5
 Z60_EXIT_SL = 3.2
-MAX_HOLD_MULT = 1.5  # max holding = 1.5 * half-life (HL)
-HL_WINDOW = 30  # domyślne okno do wyliczenia half-life, np. 30 dni
+HL_WINDOW = 30  # half-life window
 
 # --- Funkcje pomocnicze --- #
 def compute_zscore(spread, window):
@@ -22,13 +20,12 @@ def compute_zscore(spread, window):
     return (spread - mean) / std
 
 def half_life(spread):
-    # metoda Ornstein-Uhlenbeck
     spread_lag = spread.shift(1)
     spread_ret = spread - spread_lag
     beta = np.polyfit(spread_lag[1:], spread_ret[1:], 1)[0]
     return -np.log(2) / beta if beta != 0 else np.inf
 
-# --- Główny loop po parach --- #
+# --- Główny loop --- #
 results = []
 
 for x, y in pairs:
@@ -48,13 +45,11 @@ for x, y in pairs:
     # --- WARUNKI WEJŚCIA --- #
     entry_signal = None
     if abs(latest_z60) >= Z60_ENTRY_THRESHOLD and latest_avg_abs_z60 <= AVG_ABS_Z_LIMIT:
-        # potwierdzenie krótkiego okna
         if latest_z60 >= Z60_ENTRY_THRESHOLD and latest_z30 >= Z30_CONFIRM:
             entry_signal = "SHORT y / LONG x"
         elif latest_z60 <= -Z60_ENTRY_THRESHOLD and latest_z30 <= -Z30_CONFIRM:
             entry_signal = "LONG y / SHORT x"
 
-    # --- OUTPUT --- #
     results.append({
         "Pair": f"{x}/{y}",
         "Z60": latest_z60,
