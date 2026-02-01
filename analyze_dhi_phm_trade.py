@@ -3,19 +3,46 @@
 """
 analyze_dhi_phm_trade.py
 
-Analiza pary DHI/PHM wg Workflow 2 (retail):
-- Beta neutral i cash neutral spreads
-- Half-life, Z-score (60,30), vol ratio
-- ADF test
-- Beta stability (OLS 60 vs 90)
-- Wyznaczenie trybu hedgingu
-- Ocena gotowości do wejścia: TRADE_READY YES/NO
-- Kierunek: long_y_short_x lub short_y_long_x
-- Wyjście przy |Z60| ≤ 0.5
-- Raport: CSV, JSON
-- Opcjonalnie: wykres PNG
+Workflow 2 - Retail Trade Readiness for DHI / PHM
 
-Test akceptacyjny:
+RULES & PROGOWE KRITERIA:
+
+1. Dane:
+   - Start-date: 2018-01-01
+   - auto-adjust ON (Close adjusted by Yahoo Finance)
+   - Domyślnie log-returns, opcjonalnie percent-returns (--use-percent-returns)
+   - Winsoryzacja 1-99% domyślnie ON (--no-winsorize wyłącza)
+   
+2. Beta neutral:
+   - OLS: y_t = alpha + beta * x_t
+   - Beta stability: beta_60 vs beta_90
+   - Spready: spread_beta = y - (alpha+beta*x), spread_cash = y - x
+   - Half-life na spread_beta
+
+3. Z-score:
+   - Z60 i Z30 na spread_beta
+   - ΔZ3d = Z(t) - Z(t-3) (informacyjnie)
+
+4. Volatility ratio: std(spread_beta) / (std(ret_y) + std(ret_x))
+
+5. Tryb hedgingu:
+   - beta_stability_pct ≤25% -> beta_neutral
+   - beta_stability_pct ≥40% -> cash_neutral
+   - 25-35% borderline: wybierz beta_neutral tylko jeśli ADF/HL beta lepsze
+
+6. Kryteria wejścia (ENTRY) dla TRADE_READY=YES:
+   - ADF p-value ≤0.05
+   - Half-life ≤15
+   - Z60 & Z30 zgodne z LONG/SHORT (-2.0,-1.5 lub 2.0,1.5)
+   - Beta stability w przedziale dopuszczalnym
+
+7. Wyjście: |Z60| ≤0.5
+
+8. Output:
+   - CSV + JSON: results_workflow2/DHI_PHM_trade_readiness.*
+   - Opcjonalny wykres PNG: results_workflow2/DHI_PHM_spread_chart.png
+
+TEST:
 python analyze_dhi_phm_trade.py --start-date 2018-01-01 --auto-adjust --out-dir results_workflow2
 """
 
@@ -26,277 +53,254 @@ import json
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from statsmodels.tsa.stattools import adfuller
-import statsmodels.api as sm
 import matplotlib.pyplot as plt
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.regression.linear_model import OLS
+from statsmodels.tools import add_constant
 
-def download_data(tickers, start_date, auto_adjust=True):
-    df = yf.download(tickers, start=start_date, progress=False, auto_adjust=auto_adjust, threads=1)
-    # Obsługa MultiIndex
-    if isinstance(df.columns, pd.MultiIndex):
-        if "Adj Close" in df.columns.get_level_values(0):
-            df = df["Adj Close"]
-        else:
-            df = df.iloc[:, 0:len(tickers)]
-            df.columns = tickers
-    elif set(tickers).issubset(df.columns):
-        df = df[tickers]
-    else:
-        raise RuntimeError("Nie znaleziono kolumn cen w pobranych danych")
-    return df
+def download_data(tickers, start_date):
+    try:
+        df = yf.download(tickers, start=start_date, auto_adjust=True)["Close"]
+        df = df.rename(columns={tickers[0]:"y", tickers[1]:"x"})
+        return df
+    except Exception as e:
+        print(f"ERROR downloading tickers: {e}")
+        return None
 
-def log_returns(df, use_percent=False):
-    if use_percent:
-        return df.pct_change().dropna()
-    else:
-        return np.log(df / df.shift(1)).dropna()
-
-def winsorize_series(s, lower=0.01, upper=0.99):
-    return s.clip(lower=s.quantile(lower), upper=s.quantile(upper))
+def compute_returns(df, use_percent=False, winsorize=True):
+    ret = df.pct_change() if use_percent else np.log(df / df.shift(1))
+    ret = ret.dropna()
+    if winsorize:
+        ret = ret.clip(lower=ret.quantile(0.01), upper=ret.quantile(0.99))
+    return ret
 
 def rolling_ols(y, x, window):
     betas = []
-    alphas = []
     for i in range(window, len(y)+1):
-        Y = y[i-window:i]
-        X = x[i-window:i]
-        Xc = sm.add_constant(X)
-        model = sm.OLS(Y, Xc).fit()
-        alphas.append(model.params[0])
+        y_win = y[i-window:i]
+        x_win = x[i-window:i]
+        X = add_constant(x_win)
+        model = OLS(y_win, X).fit()
         betas.append(model.params[1])
-    return np.array(alphas), np.array(betas)
+    if len(betas) == 0:
+        return np.nan
+    return np.nanmean(betas)
 
 def half_life(spread):
-    delta = spread.diff().dropna().values
-    spread_lag = spread.shift(1).dropna().values
-    spread_lag = spread_lag[:len(delta)]
-    if len(delta)<2:
+    spread = spread.dropna()
+    delta = spread.diff().dropna()
+    spread_lag = spread.shift(1).dropna()
+    common_index = delta.index.intersection(spread_lag.index)
+    delta = delta.loc[common_index]
+    spread_lag = spread_lag.loc[common_index]
+    if len(delta) < 10:
         return np.nan
-    rho = np.polyfit(spread_lag, delta, 1)[0]
-    if rho <= -1 or abs(rho) < 1e-5:
+    rho = np.corrcoef(spread_lag, delta)[0,1]
+    if np.isnan(rho) or abs(rho) < 1e-6 or (1+rho)<=0:
         return np.nan
-    return -np.log(2) / np.log(1 + rho)
-
-def z_score(spread, window):
-    if len(spread) < window:
-        return np.nan
-    return (spread.iloc[-1] - spread.rolling(window).mean().iloc[-1]) / spread.rolling(window).std().iloc[-1]
-
-def analyze_pair(y, x, z_windows=[60,30], use_percent_returns=False, winsorize=True, out_dir="results_workflow2", plot=True):
-    os.makedirs(out_dir, exist_ok=True)
-    df = download_data([y, x], start_date="2018-01-01", auto_adjust=True)
-    if df.isna().sum().sum() > 0:
-        df = df.dropna()
-    if len(df) < 90:
-        return {"TRADE_READY":"NO", "reason":"Insufficient data (<90)"}    
-    ret = log_returns(df, use_percent=use_percent_returns)
-    if winsorize:
-        ret[y] = winsorize_series(ret[y])
-        ret[x] = winsorize_series(ret[x])
-
-    # Beta neutral
-    Xc = sm.add_constant(df[x])
-    ols_model = sm.OLS(df[y], Xc).fit()
-    alpha_OLS = ols_model.params[0]
-    beta_OLS = ols_model.params[1]
-
-    # Rolling betas
-    _, beta_60 = rolling_ols(ret[y], ret[x], 60)
-    _, beta_90 = rolling_ols(ret[y], ret[x], 90)
-    if len(beta_60)==0 or len(beta_90)==0:
-        return {"TRADE_READY":"NO", "reason":"Not enough rolling data"}
-    beta_stability_pct = 100 * abs(beta_60[-1] - beta_90[-1]) / (np.mean([abs(beta_60[-1]), abs(beta_90[-1])]))
-
-    # Spready
-    spread_beta = df[y] - (alpha_OLS + beta_OLS*df[x])
-    spread_cash = df[y] - df[x]
-
-    # ADF
     try:
-        adf_beta = adfuller(spread_beta.dropna())
-        adf_cash = adfuller(spread_cash.dropna())
-        adf_p_beta, adf_stat_beta = adf_beta[1], adf_beta[0]
-        adf_p_cash, adf_stat_cash = adf_cash[1], adf_cash[0]
+        hl = -np.log(2)/np.log(1+rho)
+        return hl
     except:
-        adf_p_beta, adf_stat_beta, adf_p_cash, adf_stat_cash = np.nan, np.nan, np.nan, np.nan
+        return np.nan
 
-    # Half-life
-    hl_beta = half_life(spread_beta)
-    hl_cash = half_life(spread_cash)
+def zscore(series, window):
+    if len(series) < window:
+        return np.nan
+    mean = series[-window:].mean()
+    std = series[-window:].std()
+    if std == 0:
+        return 0.0
+    return (series.iloc[-1]-mean)/std
 
-    # Z-scores
-    Zs = {}
-    for w in z_windows:
-        Zs[w] = z_score(spread_beta, w)
-    deltaZ3d = Zs[z_windows[0]] - z_score(spread_beta[:-3], z_windows[0]) if len(spread_beta)>z_windows[0]+3 else np.nan
+def adf_test(series):
+    try:
+        adf_res = adfuller(series, maxlag=1, autolag=None)
+        return adf_res[1], adf_res[0]  # p-value, test stat
+    except:
+        return np.nan, np.nan
 
-    # Volatility ratio
-    vol_ratio = spread_beta.std() / (ret[y].std() + ret[x].std())
+def beta_stability(ret_y, ret_x):
+    beta_60 = rolling_ols(ret_y, ret_x, 60)
+    beta_90 = rolling_ols(ret_y, ret_x, 90)
+    if np.isnan(beta_60) or np.isnan(beta_90) or (abs(beta_60)+abs(beta_90))==0:
+        return np.nan, beta_60, beta_90
+    pct = 100*abs(beta_60-beta_90)/((abs(beta_60)+abs(beta_90))/2)
+    return pct, beta_60, beta_90
 
-    # Hedging recommendation
-    hedge_reco = "beta_neutral"
-    if beta_stability_pct >= 40 or (hl_cash<hl_beta and adf_p_cash<adf_p_beta):
-        hedge_reco = "cash_neutral"
-    elif 25<=beta_stability_pct<=35:
-        if not ((adf_p_beta <= adf_p_cash-0.02) or (hl_beta+3 <= hl_cash)):
-            hedge_reco = "cash_neutral"
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start-date", default="2018-01-01")
+    parser.add_argument("--auto-adjust", action="store_true", default=True)
+    parser.add_argument("--use-percent-returns", action="store_true", default=False)
+    parser.add_argument("--winsorize", action="store_true", default=True)
+    parser.add_argument("--no-plot", action="store_true")
+    parser.add_argument("--out-dir", default="results_workflow2")
+    parser.add_argument("--help-checklist", action="store_true")
+    args = parser.parse_args()
 
-    # ENTRY check
-    TRADE_READY = "NO"
-    direction = "none"
-    exit_rule = "|Z60| ≤ 0.5"
-    reasons=[]
-    if hedge_reco=="beta_neutral":
-        use_spread = spread_beta
-        use_adf = adf_p_beta
-        use_hl = hl_beta
+    if args.help_checklist:
+        print("""
+Checklist TRADE_READY criteria:
+- ADF p-value <=0.05
+- Half-life <=15
+- Z60/Z30 for LONG or SHORT (-2,-1.5 or 2,1.5)
+- Beta stability <=25% or acceptable
+- Output: CSV, JSON, optional PNG
+""")
+        sys.exit(0)
+
+    tickers = ["DHI","PHM"]
+    df = download_data(tickers, args.start_date)
+    if df is None or df.empty:
+        print("ERROR: no data, TRADE_READY=NO")
+        sys.exit(1)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    ret = compute_returns(df, use_percent=args.use_percent_returns, winsorize=args.winsorize)
+
+    # Beta neutral OLS on levels
+    X = add_constant(df['x'])
+    model = OLS(df['y'], X).fit()
+    alpha_OLS, beta_OLS = model.params
+    df['spread_beta'] = df['y'] - (alpha_OLS + beta_OLS * df['x'])
+    df['spread_cash'] = df['y'] - df['x']
+
+    adf_p_beta, adf_stat_beta = adf_test(df['spread_beta'])
+    adf_p_cash, adf_stat_cash = adf_test(df['spread_cash'])
+
+    hl_beta = half_life(df['spread_beta'])
+    hl_cash = half_life(df['spread_cash'])
+
+    Z60 = zscore(df['spread_beta'], 60)
+    Z30 = zscore(df['spread_beta'], 30)
+    if len(df) >=4:
+        Z3d_delta = Z60 - zscore(df['spread_beta'].iloc[:-3], 60)  # informacyjnie
     else:
-        use_spread = spread_cash
-        use_adf = adf_p_cash
-        use_hl = hl_cash
-    if use_adf>0.05:
-        reasons.append(f"ADF {use_adf:.3f}>0.05")
-    if use_hl>15:
-        reasons.append(f"Half-life {use_hl:.1f}>15")
-    Z60 = z_score(use_spread,60)
-    Z30 = z_score(use_spread,30)
-    if Z60 is np.nan or Z30 is np.nan:
-        reasons.append("Not enough Z-score data")
-    if use_adf<=0.05 and use_hl<=15 and Z60 is not np.nan and Z30 is not np.nan:
-        if Z60<=-2 and Z30<=-1.5:
-            TRADE_READY="YES"
-            direction="long_y_short_x"
-        elif Z60>=2 and Z30>=1.5:
-            TRADE_READY="YES"
+        Z3d_delta = np.nan
+
+    vol_ratio = df['spread_beta'].std()/ (ret['y'].std() + ret['x'].std())
+
+    beta_stab_pct, beta_60, beta_90 = beta_stability(ret['y'], ret['x'])
+
+    # Hedge recommendation
+    hedge = "beta_neutral"
+    if beta_stab_pct >=40:
+        hedge="cash_neutral"
+    elif 25<beta_stab_pct<35:
+        if (adf_p_beta > adf_p_cash+0.02) or (hl_beta>hl_cash):
+            hedge="cash_neutral"
+
+    # Entry check
+    trade_ready = False
+    direction = "none"
+    exit_rule = "|Z60|<=0.5"
+    reason = []
+
+    if hedge=="beta_neutral":
+        if adf_p_beta>0.05:
+            reason.append(f"ADF_beta {adf_p_beta:.3f} > 0.05")
+        if hl_beta>15:
+            reason.append(f"Half-life_beta {hl_beta:.1f} > 15")
+        if not (-2>=Z60<=-1.5 or 2<=Z60<=1.5):
+            reason.append(f"Z60 {Z60:.3f} not triggering")
+        if beta_stab_pct>35:
+            reason.append(f"Beta stability {beta_stab_pct:.1f}% too high")
+        trade_ready = len(reason)==0
+    else:
+        if adf_p_cash>0.05:
+            reason.append(f"ADF_cash {adf_p_cash:.3f} > 0.05")
+        if hl_cash>15:
+            reason.append(f"Half-life_cash {hl_cash:.1f} > 15")
+        trade_ready = len(reason)==0
+
+    if trade_ready:
+        if Z60>=2.0:
             direction="short_y_long_x"
+        elif Z60<=-2.0:
+            direction="long_y_short_x"
         else:
-            reasons.append("Z-score thresholds not met")
+            direction="none"
+            trade_ready=False
 
     # Sizes
-    if TRADE_READY=="YES":
-        if hedge_reco=="beta_neutral":
-            size_y = 1
-            size_x = -beta_OLS
-        else:
-            size_y = 1
-            size_x = -1
-        norm = abs(size_y)+abs(size_x)
-        size_y/=norm
-        size_x/=norm
-        sizes = {"y":size_y,"x":size_x}
+    if hedge=="beta_neutral" and trade_ready:
+        w_y = 1.0
+        w_x = -beta_OLS
+        norm = abs(w_y)+abs(w_x)
+        w_y/=norm
+        w_x/=norm
+    elif hedge=="cash_neutral" and trade_ready:
+        w_y=1.0
+        w_x=-1.0
     else:
-        sizes = {"y":0,"x":0}
+        w_y=w_x=0.0
 
-    # Prepare output
-    output = {
-        "y": y,
-        "x": x,
+    result = {
+        "TRADE_READY": "YES" if trade_ready else "NO",
+        "hedge_reco": hedge,
+        "direction": direction,
+        "weights_y": round(w_y,3),
+        "weights_x": round(w_x,3),
+        "exit_rule": exit_rule,
         "alpha_OLS": round(alpha_OLS,4),
         "beta_OLS": round(beta_OLS,4),
-        "beta_stability_pct": round(beta_stability_pct,2),
-        "half_life_beta": round(hl_beta,1),
-        "half_life_cash": round(hl_cash,1),
+        "beta_stability_pct": round(beta_stab_pct,2),
         "ADF_p_beta": round(adf_p_beta,4),
-        "ADF_stat_beta": round(adf_stat_beta,4),
         "ADF_p_cash": round(adf_p_cash,4),
-        "ADF_stat_cash": round(adf_stat_cash,4),
-        "Z60": round(Z60,4),
-        "Z30": round(Z30,4),
-        "deltaZ3d": round(deltaZ3d,4),
-        "vol_ratio": round(vol_ratio,4),
-        "hedge_reco": hedge_reco,
-        "TRADE_READY": TRADE_READY,
-        "direction": direction,
-        "sizes": sizes,
-        "exit_rule": exit_rule,
-        "reasons": reasons
+        "Half_life_beta": round(hl_beta,1),
+        "Half_life_cash": round(hl_cash,1),
+        "Z60": round(Z60,3),
+        "Z30": round(Z30,3),
+        "Z3d_delta": round(Z3d_delta,3),
+        "vol_ratio": round(vol_ratio,3),
+        "reason_not_ready": reason
     }
 
     # Save CSV & JSON
-    out_csv = os.path.join(out_dir,f"{y}_{x}_trade_readiness.csv")
-    out_json = os.path.join(out_dir,f"{y}_{x}_trade_readiness.json")
-    pd.DataFrame([output]).to_csv(out_csv,index=False)
-    with open(out_json,"w") as f:
-        json.dump(output,f,indent=4)
+    df_csv = pd.DataFrame([result])
+    csv_path = os.path.join(args.out_dir,"DHI_PHM_trade_readiness.csv")
+    json_path = os.path.join(args.out_dir,"DHI_PHM_trade_readiness.json")
+    df_csv.to_csv(csv_path, index=False)
+    with open(json_path,"w") as f:
+        json.dump(result,f,indent=2)
 
-    # Plot
-    if plot:
-        plt.figure(figsize=(12,8))
-        ax1=plt.subplot(3,1,1)
-        spread_beta.plot(ax=ax1,label="spread_beta")
-        spread_beta.rolling(60).mean().plot(ax=ax1,label="roll_mean_60")
-        ax1.fill_between(spread_beta.index,
-                         spread_beta.rolling(60).mean()-2*spread_beta.rolling(60).std(),
-                         spread_beta.rolling(60).mean()+2*spread_beta.rolling(60).std(),
-                         color='gray',alpha=0.3)
-        ax1.set_title(f"{y}-{x} spread_beta")
-        ax1.legend()
-        ax2=plt.subplot(3,1,2)
-        pd.Series(Z60,index=use_spread.index[-len(Z60):]).plot(ax=ax2,label="Z60")
-        pd.Series(Z30,index=use_spread.index[-len(Z30):]).plot(ax=ax2,label="Z30")
-        ax2.axhline(2,color='red',linestyle="--")
-        ax2.axhline(1.5,color='orange',linestyle="--")
-        ax2.axhline(-1.5,color='orange',linestyle="--")
-        ax2.axhline(-2,color='red',linestyle="--")
-        ax2.axhline(0.5,color='green',linestyle="--")
-        ax2.axhline(-0.5,color='green',linestyle="--")
-        ax2.set_title("Z-scores")
-        ax2.legend()
-        ax3=plt.subplot(3,1,3)
-        spread_beta[-250:].plot(ax=ax3,label="spread_beta")
-        spread_cash[-250:].plot(ax=ax3,label="spread_cash")
-        ax3.set_title("Spread beta vs cash (last 250)")
-        ax3.legend()
+    # Optional plot
+    if not args.no_plot:
+        png_path = os.path.join(args.out_dir,"DHI_PHM_spread_chart.png")
+        fig, axes = plt.subplots(3,1, figsize=(12,12))
+        axes[0].plot(df['spread_beta'], label="spread_beta")
+        axes[0].axhline(df['spread_beta'].rolling(60).mean(),color='green',ls='--',label="MA60")
+        axes[0].axhline(df['spread_beta'].rolling(60).mean()+2*df['spread_beta'].rolling(60).std(),color='red',ls=':',label="+2σ")
+        axes[0].axhline(df['spread_beta'].rolling(60).mean()-2*df['spread_beta'].rolling(60).std(),color='red',ls=':',label="-2σ")
+        axes[0].set_title("Spread Beta")
+        axes[0].legend()
+        axes[1].plot([Z60]*len(df),label="Z60")
+        axes[1].plot([Z30]*len(df),label="Z30")
+        axes[1].axhline(2,color='red',ls=':')
+        axes[1].axhline(-2,color='red',ls=':')
+        axes[1].axhline(1.5,color='orange',ls=':')
+        axes[1].axhline(-1.5,color='orange',ls=':')
+        axes[1].axhline(0.5,color='green',ls='--')
+        axes[1].axhline(-0.5,color='green',ls='--')
+        axes[1].set_title("Z-scores")
+        axes[1].legend()
+        axes[2].plot(df['spread_beta'].iloc[-250:],label="spread_beta")
+        axes[2].plot(df['spread_cash'].iloc[-250:],label="spread_cash")
+        axes[2].set_title(f"Beta vs Cash Spread last 250 sessions\nADF_p_beta={adf_p_beta:.3f},ADF_p_cash={adf_p_cash:.3f}")
+        axes[2].legend()
         plt.tight_layout()
-        plt.savefig(os.path.join(out_dir,f"{y}_{x}_spread_chart.png"))
+        plt.savefig(png_path)
         plt.close()
 
-    # Print summary
-    print(f"TRADE_READY: {TRADE_READY}")
-    print(f"hedge_reco: {hedge_reco}")
-    print(f"direction: {direction}")
-    print(f"sizes: {sizes}")
-    print(f"exit_rule: {exit_rule}")
-    if reasons:
-        print("Reasons:", reasons)
-    return output
-
-def print_checklist():
-    print("""
-Checklist dla DHI/PHM:
-1) ADF_p_beta <= 0.05
-2) Half-life_beta <= 15
-3) Z60 <= -2.0 i Z30 <= -1.5 → LONG / Z60 >=2 i Z30>=1.5 → SHORT
-4) Beta stability <=25% lub 25-35% tylko przy lepszych metrykach beta
-5) Wyjście: |Z60| ≤ 0.5
-""")
-
-def main():
-    parser = argparse.ArgumentParser(description="Analyze DHI/PHM trade readiness")
-    parser.add_argument("--start-date",default="2018-01-01")
-    parser.add_argument("--auto-adjust",dest="auto_adjust",action="store_true")
-    parser.add_argument("--no-auto-adjust",dest="auto_adjust",action="store_false")
-    parser.set_defaults(auto_adjust=True)
-    parser.add_argument("--use-percent-returns",action="store_true")
-    parser.add_argument("--winsorize",action="store_true")
-    parser.add_argument("--no-winsorize",dest="winsorize",action="store_false")
-    parser.set_defaults(winsorize=True)
-    parser.add_argument("--z-lookbacks",default="60,30")
-    parser.add_argument("--min-sample",type=int,default=200)
-    parser.add_argument("--out-dir",default="results_workflow2")
-    parser.add_argument("--plot",dest="plot",action="store_true")
-    parser.add_argument("--no-plot",dest="plot",action="store_false")
-    parser.set_defaults(plot=True)
-    parser.add_argument("--help-checklist",action="store_true")
-    args = parser.parse_args()
-    if args.help_checklist:
-        print_checklist()
-        sys.exit(0)
-    analyze_pair("DHI","PHM",z_windows=[int(w) for w in args.z_lookbacks.split(",")],
-                 use_percent_returns=args.use_percent_returns,
-                 winsorize=args.winsorize,
-                 out_dir=args.out_dir,
-                 plot=args.plot)
+    # Console summary
+    print(f"\nTRADE_READY = {result['TRADE_READY']}")
+    print(f"Hedge recommendation = {result['hedge_reco']}")
+    print(f"Direction = {result['direction']}")
+    print(f"Weights: y={result['weights_y']}, x={result['weights_x']}")
+    print(f"Exit rule = {result['exit_rule']}")
+    if not trade_ready:
+        print("Reasons not ready:", "; ".join(reason))
 
 if __name__=="__main__":
     main()
