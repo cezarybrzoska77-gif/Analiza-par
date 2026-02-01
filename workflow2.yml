@@ -1,0 +1,33 @@
+name: Workflow 2 – LEN/MTH & DHI/MTH
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 18 * * 1-5'  # uruchamiaj codziennie o 18:00 w dni robocze
+
+jobs:
+  run_workflow2:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Workflow2 trading
+        run: python workflow2.py
+
+      - name: Upload results
+        uses: actions/upload-artifact@v3
+        with:
+          name: workflow2_results
+          path: workflow2_results.csv
